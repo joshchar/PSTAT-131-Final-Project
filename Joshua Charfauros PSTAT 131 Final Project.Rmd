@@ -1,0 +1,237 @@
+---
+title: "Joshua Charfauros PSTAT 131 Final Project"
+author: "Joshua Charfauros"
+date: "2024-03-15"
+output: 
+  html_document:
+    toc : TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, toc = TRUE)
+library(tidyverse)
+library(tidymodels)
+library(ggplot2)
+library(janitor)
+library(corrplot)
+library(ranger)
+library(yardstick)
+library(caret)
+set.seed(49)
+
+```
+
+```{r}
+datad <- read_csv("/Users/joshc/Downloads/nflgameproject.csv", show_col_types = FALSE)
+
+```
+
+# Introduction
+
+
+My data set is a collection of 448 NFL games from the 2021 and 2022 seasons taken from NFLFastR ((<https://github.com/nflverse/nflfastR>)). I seek to predict the the effectiveness of NFL offenses measured by their Passing EPA. Passing EPA is an offense's expected points added per passing play they run in a game. I seek to create models that quantify the effect and non effect of multiple pregame factors on Passing EPA. My codebook explaining the variables is included in my submission.
+
+With these sorts of predictions, defenses would be able to change their strategy to better combat an extremely effective passing game, or actively choose to disregard passing more, if the predicted Passing EPA is low. Other places these predictions could be applied is into the sports betting world. Sports books could take these predictions and level them into the lines that they create, and sports bettors could take these predictions and use them to choose which bets to take and not take. Similarly, fantasy football players could use these predictions to see which of their available players will be expected to perform better in an upcoming game. If they know that the a certain offense is expected to perform poorly in the given conditions of an upcoming game, they could choose to start a player from a different offense.
+
+As for missing data, I don't have any. The NFLFastR database has much more available data, I specifically chose columns that were not missing data, and that I thought could have a tangible effect on Passing EPA.
+
+# Exploratory Data Analysis
+
+```{r}
+cleaned <- clean_names(datad)
+cleaned <- cleaned %>% mutate(posteam = factor(posteam), precipitation = factor(precipitation), surface = factor(surface)) %>% select(-roof, -weekday, -game_id, -rush_rate)
+```
+
+Here I am just cleaning up the column names and converting the categorical data into factors. When I was originally selecting my columns to include in my data set, I was taking anything that I thought could be an interesting predictor. After further investigation I decided to remove some of those columns from my analysis. I removed the 'roof' predictor because there was actually only 1 value throughout all of the games. All games had been marked as played "outdoors," so if 'roof' always took the same value, it's essentially a useless predictor. I took out 'weekday' because it was giving me lots of problems during my exploratory data analysis, and given that the vast majority of NFL games are played on Sundays, I figured dealing with the bugs associated with 'weekday' just wasn't worth the little to no change it would have on my models. I removed 'game_id' because, while it is useful to know what game has what conditions, when training our models, the name of the game really should have no effect on anything. Lastly I removed 'rush_rate' since it is essentially the inverse of 'pass_rate.' While this is not strictly true, sometimes special teams plays are run, I did not feel the need to essentially include the same predictor twice.
+
+### Passing EPA by Team
+
+```{r}
+means <- cleaned %>% group_by(posteam) %>%
+  summarize(mean_pass_epa = mean(pass_epa_game, na.rm = TRUE))
+ordered<- means %>% arrange(desc(mean_pass_epa)) %>% pull(posteam)
+
+ggplot(cleaned, aes(x = factor(posteam, levels = ordered), y = pass_epa_game)) +
+  geom_point(alpha = 0.5) + labs(x = "Team", y = "Passing EPA") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+This graph shows every offense's performance organized by Mean Passing EPA. The teams go from left to right with decreasing Mean Passing EPA. Each point on the graph is a specific game's Passing EPA (many points overlap which is why some teams seem more populated than others). As we can see from the graph, the Arizona Cardinals have the best Mean Passing EPA, and the Houston Texans have the worst. 
+
+### Passing EPA Boxplot
+
+```{r}
+ggplot(cleaned, aes(x = "", y = pass_epa_game)) + geom_boxplot() + stat_summary(fun = function(y) round(quantile(y, probs = c(.25, .5, .75)), 4), geom = "text", aes(label = paste("Q", c(1,2,3), ": ", after_stat(y), sep = " ")), position = position_nudge(x = -.5)) + labs(y = "Passing EPA")
+```
+
+This graph shows the distribution of Passing EPA across all teams. The median expected points added for any given passing play during the 2021 and 2022 NFL seasons is 0.0095 points. The first quartile is -.1861 and the third quartile is .2076. From this we can see that Passing EPA can also be negative. This may seem counter intuitive but when looking deeper we can understand how this happens. Most obviously, quarterbacks can throw interceptions that are returned for touchdowns. That passing play caused -6 points by our measurements. Quarterbacks can also not complete a pass, burning a down, and leading towards the other team receiving the ball. While I'm not exactly sure the ways in which NFLFastR quantifies that amount of loss, it is definitely a negative production and not helping his offense toward scoring points. 
+
+Applying this knowledge to our future analysis, we know that the values we are working with are quite small. Most of our data is between roughly -.2 and .2. Thus, when evaluating model efficiency in the future, we must keep these values in mind.
+
+### Correlation Matrix
+```{r}
+formatt <- cleaned %>% mutate(posteam = as.integer(posteam), precipitation = as.integer(precipitation), surface = as.integer(surface))
+matty <- cor(formatt)
+corrplot(matty, method = 'circle', type = 'upper')
+```
+
+There seems to be little correlation between many of our pregame factors. Some notable correlations are between week and temp, spread_line and epa_pass_last3, total_line and epa_pass_last3, and pass_rate and pass_rate_last 3. According to our correlation matrix, as week increases temperature decreases. This makes sense because the NFL season starts in September and as week increases, we are getting deeper into the colder winter months, hence low temperatures. According to our correlation matrix, as spread_line increases, epa_pass_last3 decreases. This makes sense, because if the spread line is increasing, that means the team is favored to win less and less. It would then line up that the offenses point production recently (measured in Passing EPA) is not high, hence a low epa_pass_last3. According to our correlation matrix, as total_line increases epa_pass_last3 also increases. This would make sense, because if a team has been scoring more points recently they would have a higher epa_pass_last3 which would then lead sportsbooks to predict that they would continue this point scoring trend and hence a higher total_line. Lastly our correlation matrix says that as pass_rate increases so does pass_rate_last3. This is more of a psychology / strategy phenomena. If an offense has been passing a lot in their recent it makes sense that they would continue this into their upcoming game, hence a rise in pass_rate.
+
+### Wind vs Passing EPA
+```{r}
+ggplot(data = cleaned, aes(x = wind, y = pass_epa_game)) + geom_point() + geom_smooth(method = "lm") + labs(x = 'Wind (MPH)', y = "Passing EPA")
+```
+
+This graph shows a scatter plot of Wind Speed (MPH) vs Passing EPA. NFLFastR lists its wind speeds in integers, hence the column looking plot. What this shows us is that as wind increases, Passing EPA decreases. At first glance, it may seem that there is not much of a change throughout, however, since our values are so small, there is a tangible decrease. Intuitively this makes sense. If there is more wind, there's a higher chance that the flight of the ball would get interrupted mid pass. This graph shows us that once wind speeds get near to 20 MPH, Passing EPA becomes negative on average.
+
+
+```{r}
+ggplot(data = cleaned, aes(x = wind, y = pass_rate)) + geom_point() + geom_smooth(method = "lm") + labs(x = 'Wind (MPH)', y = "Passing Rate")
+```
+
+This graph shows a scatter plot of Wind Speed (MPH) vs Passing Rate. My next question then was how does Wind effect how often offenses are throwing the ball. My thought was along the lines of "Yes our data shows that wind negatively effects Passing EPA, but what if offenses simply aren't passing as much in high winds. Perhaps the quarterback hasn't been throwing as much that day, they're not as warmed up, and that is also contributing to their lesser performance." And while I may have been partially correct, I don't think the decrease is as much as I had expected. It seems that passing rates only decrease in the range of about 5-7% showing that their passing frequency likely isn't having much of an effect on Passing EPA and it is in fact more of the Wind Speed.
+
+# Model Set Up
+
+After having done some exploration through our data, it is time to start modeling.
+
+## Data Split
+
+```{r}
+splity <- initial_split(cleaned, prop = .75, strata = pass_epa_game)
+train <- training(splity)
+test <- testing(splity)
+```
+
+Here I have split my data into a training and a testing set. The training set will be used to train our numerous models and is the bigger of the 2 sets. Later we will evaluate each model using Root Mean Squared Error (RMSE) and only the model that performs best on our training data will then be tested using our testing data. I've decided to split my data into 75% training and 25% testing. Given my 448 total observations, using 336 (75%) to train my models and 112 (25%) to test my models is an adequate split. I am also stratifying my data using my response variable pass_epa_game. I want both my training and testing set to be representative of the data as a whole, so by stratifying on pass_epa_game, I can ensure both sets have an equal distribution of my response. 
+
+```{r}
+rec <- recipe(pass_epa_game ~., data = train) %>% step_dummy(posteam, precipitation, surface) %>% step_center(all_numeric_predictors()) %>% step_scale(all_numeric_predictors()) 
+
+```
+
+Here I am creating a recipe that will be used for all of my models. I am predicting pass_epa_game with all of the predictors in my training data. I have no missing data so I have no need to do any imputing in my recipe. I have dummy coded posteam, precipitation and surface as they are categorical variables, and I have made sure to center and scale all of my numeric predictors. 
+
+
+```{r}
+folds <- vfold_cv(train, v= 5, strata = pass_epa_game)
+```
+Here I am creating 5 folds for k-fold cross validation. Using k-fold cross validation instead of only splitting the data into training and testing helps to reduce variance of our estimates and model accuracy. We are splitting the data again into 5 folds and during each step of the cross validation, 4 folds are used to training and 1 is used to test. This is adding another layer of testing to our methods, ensuring better model accuracy. I again have stratified on the response variable pass_epa_game.
+
+## Creating models
+
+### Elastic Net
+```{r}
+elasticmodel <- linear_reg(mixture = tune(), penalty = tune()) %>% set_engine('glmnet') %>% set_mode('regression')
+
+eflow <- workflow() %>% add_recipe(rec) %>% add_model(elasticmodel)
+
+egrid <- grid_regular(levels = 10, mixture(range = c(0,1)), penalty(range = c(-5,5)))
+etune<- tune_grid(eflow, resamples = folds, grid = egrid)
+```
+
+This is the setup of my elastic net model, its associated workflow, grid and finally tuning it using our 5 folds from before. I have chosen to have 10 levels, mixture between 0 and 1, and penalty between -5 and 5.
+
+### K Nearest Neighbors
+```{r}
+knnmodel <- nearest_neighbor(neighbors = tune()) %>% set_engine('kknn') %>% set_mode('regression')
+
+knnflow <- workflow()%>% add_recipe(rec) %>% add_model(knnmodel)
+
+knngrid <- grid_regular(neighbors(range = c(1,10)), levels = 10)
+
+fitknn <- tune_grid(knnflow,folds,knngrid)
+```
+This is the setup of my KNN model its associated workflow, grid and finally tuning it using our 5 folds from before. I have chosen to have 10 levels, and have the number of neighbors range from 1-10.
+
+### Linear Regression
+```{r}
+linearmodel <- linear_reg() %>% set_engine('lm') %>% set_mode('regression')
+
+linearflow <- workflow() %>% add_recipe(rec) %>% add_model(linearmodel)
+
+fitlin <- fit_resamples(linearflow, folds)
+```
+This is the setup of my linear regression model, its associated workflow and then re-sampling it using the folds from before. Here there is no grid or tuning since linear regression does not have the variable hyperparameters to do so. 
+
+### Random Forest
+```{r}
+forest <- rand_forest(mtry = tune(), trees = tune(), min_n = tune()) %>% set_engine('ranger', importance = "impurity") %>% set_mode('regression') 
+
+fflow <- workflow() %>% add_recipe(rec) %>% add_model(forest)
+
+fgrid <- grid_regular(levels = 8, mtry(range = c(1,14)), trees( range = c(50,500)), min_n( range = c(1,50)))
+
+```
+
+
+```{r, eval=FALSE}
+fftune <- tune_grid(fflow, resamples = folds, grid = fgrid, metrics = metric_set(rmse))
+save(fftune, file = 'fftune.rda')
+```
+Lastly is my random forest model. Here, for the sake of knitting time, I have tuned my model once, and then saved the data to an external file which I will load in later. Oftentimes random forests can take quite a while to run so this circumvents that problem. I have chosen mtry to range from 1-14 (I have 14 predictors), trees to range from 50-500 and min_n between 1 and 50.
+
+## Interpretting Autoplots
+
+
+### Elastic Net
+```{r}
+autoplot(etune, metric = 'rmse')
+select_best(etune)
+```
+My elastic net model was tuned at 10 different levels with mixture ranging from 0 to 1 and penalty ranging from -5 to 5. From the graph we can gather that the best model performance (quantified by low RMSE) comes with low to middling penalty values in the approximate range of .01-.1, and with higher mixture levels. Using the select_best() function, we can see that the best elastic net model has penalty = .0215 and mixture = .888.
+
+### Random Forest
+```{r}
+load('fftune.rda')
+autoplot(fftune, metric = 'rmse')
+select_best(fftune)
+```
+Here I have re loaded in the tuned random forest model from an external file. My random forest model was tuned at 8 different levels with mtry ranging from 1-14, trees ranging from 50-500 and min_n ranging from 1-50. From the graph we can gather that the best model performance comes with lower min_n values, middling - higher tree values and middling - higher number of randomly selected predictors (mtry). Using the select_best() function, we can see that the best random forest model has mtry = 10, tress = 114, and min_n = 1.
+
+### K Nearest Neighbors
+
+```{r}
+autoplot(fitknn, metric = 'rmse')
+select_best(fitknn)
+```
+My K Nearest Neighbors plot was tuned at 10 different levels with number of neighbors ranging from 1-10. This plot is not as exciting as the others. We can gather from this plot that as the number of neighbors increases, the RMSE decreases exponentially. Using the select_best() function, we can see that the best KNN model has neighbors = 14. I did not know this before but apparently the tuning algorithm can choose ideal parameters outside of the specified range. You learn something new everyday.
+
+## Evaluating Model Performance
+
+Now that we have created and tuned all of our models, let's evaluate their performance. I will do this by collecting the best model from each model type. The model from each category with the lowest mean RMSE will be deemed the best. Then I will compare the best of each category to find the best of the best. That will be the model I use my testing data on.
+```{r}
+knnmetrics <- collect_metrics(fitknn) %>% filter(.metric == 'rmse') %>% arrange(mean) %>% slice(1)
+linearmetrics <- collect_metrics(fitlin) %>% filter(.metric == 'rmse')%>% arrange(mean) %>% slice(1)
+elasticmetrics <- collect_metrics(etune) %>% filter(.metric == 'rmse')%>% arrange(mean) %>% slice(1)
+forestmetrics <- collect_metrics(fftune) %>% filter(.metric == 'rmse')%>% arrange(mean) %>% slice(1)
+```
+
+```{r}
+comparison <- tibble(Model = c("K Nearest Neighbors", "Linear Regression", "Elastic Net", "Random Forest"), RMSE = c(knnmetrics$mean, linearmetrics$mean, elasticmetrics$mean, forestmetrics$mean)) %>% arrange(RMSE)
+
+comparison
+```
+As you can see, the random forest model has the best mean RMSE of our available models. Thus my best overall model is a random forest with mtry = 10, tress = 114, and min_n = 1.
+
+# My Best Model
+
+Now that I have my best model, I will finalize its workflow, fit the model and then evaluate its performance on the testing data. 
+```{r}
+
+forestfit <- fit(finalize_workflow(fflow, select_best(fftune, metric = 'rmse')), data = train)
+
+
+#this is how it does on the testing set
+augment(forestfit, new_data = test) %>% rmse(pass_epa_game, .pred)
+augment(forestfit, new_data = test) %>% mape(pass_epa_game, .pred)
+```
+The random forest model performed slightly better on the testing data with an estimate RMSE of .26. However, as you may recall from my earlier box plot, this actually isn't very good. To better quantify the quality of this estimate I also showed the Mean Absolute Percentage Error (MAPE) of the model. On average, this model is off by 141%. It doesn't take a statistical genius to realize that this model's performance is well, underwhelming. 
+
+# Conclusion
+
+
+
+So what have I learned? It turns out that Passing EPA is actually pretty hard to predict using pregame factors. While I was able to create models with some amount of predictive power, my best one was off by 141% on average. After looking into the MAPE performance of my other models, my KNN model was off by 203% on average, my linear regression model was off by 218% on average, and my elastic net was off by 163% on average. I believe that the reason for this is that there is simply too much going on in an NFL game. Quarterbacks are effected by so much more than just the 14 predictors I used to model their efficiency. Quarterbacks are human beings, they have personal lives, they might be feeling a little sick that day, the defense could've predicted which play they were going to run, the quarterback could've thrown a perfect pass and it just slipped through the hands of the receiver. None of these crucial details are accounted for by a model that only takes in pregame factors. The human aspect of performance is very difficult to account for which is exactly what makes sports exciting. If all of it was predictable by a computer and you always knew the favored team would win, sports would be much less entertaining. Something as small as a loss against this team in their previous outing or a comment made on the field can literally change the entirety of a quarterbacks performance, making predictions quite difficult. 
+
+As far as future analysis, I think that recent trends should be taken into account much more than I did in this project. I had included in my predictors rushing and passing EPA over the last 3 games as well as passing rate over the last 3 games but I think it needs to be more than that. Also included should be some sort of metric of the defense's recent performance against passing plays, how often defenses set up to defend rushing or passing plays, as well as something like catch success rate for the teams receivers. Taking into account these sorts of predictors could maybe help to create a better predictive model in the future.
